@@ -1,0 +1,561 @@
+import { ChangeDetectionStrategy, Component, computed, signal, WritableSignal, effect } from '@angular/core';
+import { CommonModule } from '@angular/common';
+
+// Firebase imports are now handled dynamically below
+
+// --- Interfaces for our data structures ---
+interface Hit {
+  id: number;
+  delayDays: number;
+  subject: string;
+  content: string;
+  type: 'in_thread' | 'new_thread';
+}
+
+interface Crew {
+  id: string;
+  name: string;
+}
+
+interface Operation {
+  id: string;
+  honchoEmail: string;
+  crewId?: string;
+  status: 'designing' | 'active' | 'stopped' | 'completed';
+  initialSubject: string;
+  initialContent: string;
+  hits: Hit[];
+  // Simulation-specific properties
+  startDate?: number | null;
+  hitsSent: number;
+  lastHitDate?: number | null;
+}
+
+// --- Main App Component ---
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [CommonModule],
+  template: `
+    <script src="https://cdn.tailwindcss.com"></script>
+    <div class="min-h-screen bg-gray-900 text-gray-100 p-4 sm:p-8 font-sans">
+      <div class="max-w-6xl mx-auto">
+
+        <!-- Page Switch: Library or Editor -->
+        @if (currentPage() === 'library') {
+          <!-- LIBRARY VIEW (Honcho Hit List) -->
+          <div class="animate-fade-in">
+            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6">
+              <div>
+                <h1 class="text-5xl font-extrabold text-white mb-2">The Honcho Hit List</h1>
+                <p class="text-lg text-lime-400">Manage your high-value target operations.</p>
+              </div>
+              <!-- Auth Status -->
+              <div class="mt-4 sm:mt-0">
+                @if(user()) {
+                  <div class="text-right p-3 bg-gray-800 rounded-lg border border-green-500/50">
+                    <p class="font-bold text-green-400">
+                      @if(user().isAnonymous) {
+                        Connected Anonymously
+                      } @else {
+                        Connected
+                      }
+                    </p>
+                    <p class="text-sm text-gray-400">{{ user().email || 'Anonymous User' }}</p>
+                    @if(!user().isAnonymous) {
+                      <button (click)="handleSignOut()" class="text-xs text-red-400 hover:underline mt-1">Sign Out</button>
+                    }
+                  </div>
+                } @else {
+                  <div class="text-right p-3 bg-gray-800 rounded-lg border border-gray-700">
+                     <p class="font-bold text-gray-400">Connecting...</p>
+                  </div>
+                }
+              </div>
+            </div>
+            
+            <div class="flex flex-col sm:flex-row items-center gap-4 mb-8">
+              <button (click)="startNewOperation()" [disabled]="!user()"
+                      class="w-full sm:w-auto flex-shrink-0 py-4 px-6 bg-lime-500 text-gray-900 font-bold rounded-lg shadow-lg hover:bg-lime-400 transition-all duration-200 transform hover:scale-105 disabled:bg-gray-600 disabled:cursor-not-allowed disabled:scale-100"
+                      [title]="!user() ? 'Please sign in to launch an operation' : ''">
+                + LAUNCH NEW OPERATION
+              </button>
+              
+              <!-- Filters -->
+              <div class="w-full grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label for="crewFilter" class="block text-sm font-medium text-gray-400 mb-1">Filter by Crew</label>
+                  <select id="crewFilter" (change)="activeCrewFilter.set($event.target.value)"
+                          class="w-full p-4 bg-gray-800 border-gray-700 rounded-lg focus:ring-lime-500 focus:border-lime-500">
+                    <option value="all">All Crews</option>
+                    @for(crew of crews(); track crew.id) {
+                      <option [value]="crew.id">{{ crew.name }}</option>
+                    }
+                  </select>
+                </div>
+                <div>
+                  <label for="statusFilter" class="block text-sm font-medium text-gray-400 mb-1">Filter by Status</label>
+                  <select id="statusFilter" (change)="activeStatusFilter.set($event.target.value)"
+                          class="w-full p-4 bg-gray-800 border-gray-700 rounded-lg focus:ring-lime-500 focus:border-lime-500">
+                    <option value="all">All Statuses</option>
+                    <option value="designing">Not Started</option>
+                    <option value="active">In Process</option>
+                    <option value="completed">Completed</option>
+                    <option value="stopped">Stopped</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+            
+            <!-- Loading State -->
+            @if(isLoading()) {
+              <p class="text-center text-gray-400 py-10">Loading your operations...</p>
+            }
+
+            <!-- Operations Grid -->
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              @for (op of filteredOperations(); track op.id) {
+                <div class="bg-gray-800 p-5 rounded-xl shadow-lg border border-gray-700 flex flex-col justify-between hover:border-lime-500 transition-colors duration-200">
+                  <div>
+                    <div class="flex justify-between items-start mb-3">
+                      <h3 class="text-xl font-bold truncate pr-2">{{ op.honchoEmail }}</h3>
+                      <span class="px-3 py-1 text-xs font-semibold rounded-full whitespace-nowrap"
+                            [ngClass]="{
+                              'bg-blue-500/20 text-blue-300': op.status === 'designing',
+                              'bg-green-500/20 text-green-300': op.status === 'active',
+                              'bg-yellow-500/20 text-yellow-300': op.status === 'stopped',
+                              'bg-gray-500/20 text-gray-300': op.status === 'completed'
+                            }">
+                        {{ op.status | titlecase }}
+                      </span>
+                    </div>
+
+                    <div class="mb-3">
+                      <span class="text-xs font-semibold inline-block py-1 px-2 uppercase rounded-full text-indigo-300 bg-indigo-800/50">
+                        Crew: {{ getCrewNameById(op.crewId) || 'None' }}
+                      </span>
+                    </div>
+
+                    <div class="space-y-2 text-sm text-gray-400">
+                      <p><strong>Total Duration:</strong> {{ getTotalDays(op) }} days</p>
+                      <p><strong>Days Run:</strong> {{ getDaysRun(op) }}</p>
+                      <p><strong>Hits Sent:</strong> {{ op.hitsSent }} / {{ op.hits.length + 1 }}</p>
+                      <p><strong>Last Hit:</strong> {{ op.lastHitDate ? (op.lastHitDate | date:'mediumDate') : 'N/A' }}</p>
+                    </div>
+                  </div>
+                  
+                  <div class="mt-4 pt-4 border-t border-gray-700 flex space-x-2">
+                    <button (click)="editOperation(op)" class="w-full px-4 py-2 bg-gray-700 text-white font-medium rounded-lg hover:bg-gray-600 transition-colors">Edit</button>
+                    <button (click)="deleteOperation(op.id)" class="px-4 py-2 bg-red-800/50 text-red-300 rounded-lg hover:bg-red-800/80 transition-colors">&times;</button>
+                  </div>
+                </div>
+              } @empty {
+                @if(!isLoading() && user()) {
+                  <p class="text-gray-500 text-center md:col-span-2 lg:col-span-3 py-10">No operations found with the current filters.</p>
+                } @else if (!user()) {
+                  <p class="text-gray-500 text-center md:col-span-2 lg:col-span-3 py-10">Please sign in to view and create operations.</p>
+                }
+              }
+            </div>
+          </div>
+        } @else if (activeOperation()) {
+          <!-- EDITOR VIEW -->
+          <div class="animate-fade-in">
+            <button (click)="navigateTo('library')" class="mb-4 text-lime-400 hover:text-lime-300">&larr; Back to Honcho Hit List</button>
+            <h1 class="text-4xl font-extrabold text-white mb-2">Operation Editor</h1>
+            <p class="text-lg text-gray-400 mb-6">Planning the hits for: <strong class="text-lime-400">{{ activeOperation().honchoEmail() || 'New Honcho' }}</strong></p>
+
+            <div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700">
+               <h2 class="text-2xl font-semibold text-white mb-4">Target and Initial Hit</h2>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                <div>
+                  <label for="recipient" class="block text-sm font-medium text-gray-400">Honcho's Email</label>
+                  <input type="email" id="recipient" [disabled]="isOperationActive()" [value]="activeOperation().honchoEmail()"
+                         (input)="updateActiveOp('honchoEmail', $event.target.value)"
+                         class="mt-1 block w-full bg-gray-900 border-gray-600 rounded-lg shadow-sm p-2 focus:ring-lime-500 focus:border-lime-500">
+                </div>
+                <div>
+                  <label for="crewName" class="block text-sm font-medium text-gray-400">Crew Name (e.g. "Investors")</label>
+                  <input type="text" id="crewName" [disabled]="isOperationActive()" [value]="activeOperation().crewName()"
+                         (input)="updateActiveOp('crewName', $event.target.value)"
+                         class="mt-1 block w-full bg-gray-900 border-gray-600 rounded-lg shadow-sm p-2 focus:ring-lime-500 focus:border-lime-500">
+                </div>
+              </div>
+              <div class="mb-6">
+                <label for="initialSubject" class="block text-sm font-medium text-gray-400">Initial Hit Subject</label>
+                <input type="text" id="initialSubject" [disabled]="isOperationActive()" [value]="activeOperation().initialSubject()"
+                       (input)="updateActiveOp('initialSubject', $event.target.value)"
+                       class="mt-1 block w-full bg-gray-900 border-gray-600 rounded-lg shadow-sm p-2 focus:ring-lime-500 focus:border-lime-500">
+              </div>
+              <div class="mb-6">
+                <label for="initialContent" class="block text-sm font-medium text-gray-400">Initial Hit Content</label>
+                <textarea id="initialContent" rows="4" [disabled]="isOperationActive()" [value]="activeOperation().initialContent()"
+                          (input)="updateActiveOp('initialContent', $event.target.value)"
+                          class="mt-1 block w-full bg-gray-900 border-gray-600 rounded-lg shadow-sm p-2 focus:ring-lime-500 focus:border-lime-500"></textarea>
+              </div>
+
+              <h3 class="text-xl font-semibold text-white my-4 border-t border-gray-700 pt-4">Automated Follow-up Hits ({{ activeOperation().hits().length }} hits)</h3>
+              
+              @for (hit of activeOperation().hits(); track hit.id) {
+                <div class="bg-gray-900/50 p-4 rounded-lg mb-4 border border-gray-700">
+                    <div class="flex flex-col sm:flex-row items-end sm:items-center gap-4">
+                        <div class="w-full sm:w-1/4">
+                            <label class="block text-xs font-medium text-gray-400">Delay (Days)</label>
+                            <input type="number" min="1" [value]="hit.delayDays" (input)="updateHit(hit.id, 'delayDays', $event.target.value)"
+                                [disabled]="isOperationActive()" class="mt-1 w-full bg-gray-900 border-gray-600 rounded-lg p-1.5 text-sm">
+                        </div>
+                        <div class="w-full sm:w-1/4">
+                            <label class="block text-xs font-medium text-gray-400">Type</label>
+                            <select [value]="hit.type" (change)="updateHit(hit.id, 'type', $event.target.value)" [disabled]="isOperationActive()"
+                                    class="mt-1 w-full bg-gray-900 border-gray-600 rounded-lg p-1.5 text-sm">
+                                <option value="in_thread">In-Thread</option>
+                                <option value="new_thread">New Thread</option>
+                            </select>
+                        </div>
+                        <div class="w-full sm:w-2/4">
+                            <label class="block text-xs font-medium text-gray-400">Subject</label>
+                            <input type="text" [value]="hit.subject" (input)="updateHit(hit.id, 'subject', $event.target.value)"
+                                [disabled]="isOperationActive() || hit.type === 'in_thread'"
+                                [placeholder]="hit.type === 'in_thread' ? 'Responds in-thread (Re:)' : 'Enter subject for new thread'"
+                                class="mt-1 w-full bg-gray-900 border-gray-600 rounded-lg p-1.5 text-sm disabled:bg-gray-800 disabled:text-gray-500">
+                        </div>
+                        <div class="w-full sm:w-auto flex justify-end self-center">
+                            <button (click)="removeHit(hit.id)" [disabled]="isOperationActive()"
+                                    class="px-3 py-1.5 bg-red-800/50 text-red-300 rounded-lg hover:bg-red-800/80 transition-colors text-sm">Remove</button>
+                        </div>
+                    </div>
+                    <textarea rows="2" [value]="hit.content" (input)="updateHit(hit.id, 'content', $event.target.value)"
+                              placeholder="Follow-up hit content..." [disabled]="isOperationActive()"
+                              class="mt-3 w-full bg-gray-900 border-gray-600 rounded-lg p-2 text-sm"></textarea>
+                </div>
+              }
+              
+              <button (click)="addHit()" [disabled]="isOperationActive()"
+                      class="w-full py-2 bg-gray-700 text-gray-300 font-medium rounded-lg hover:bg-gray-600 transition disabled:opacity-50">
+                + Add Follow-up Hit
+              </button>
+
+              <div class="mt-8 pt-6 border-t border-gray-700 flex flex-col sm:flex-row justify-between items-center space-y-4 sm:space-y-0">
+                  <button (click)="saveOperation()" class="w-full sm:w-auto px-6 py-3 bg-lime-500 text-gray-900 font-bold rounded-lg shadow-lg hover:bg-lime-400 transition transform hover:scale-105">
+                    Save Operation
+                  </button>
+                  @if (activeOperation().status() === 'designing') {
+                    <button (click)="startCurrentOperation()" [disabled]="!isOperationValid() || !user()"
+                            class="w-full sm:w-auto px-6 py-3 bg-blue-600 text-white font-bold rounded-lg shadow-lg hover:bg-blue-500 transition disabled:bg-blue-800 disabled:text-gray-400"
+                            [title]="!user() ? 'You must be signed in to launch an operation' : ''">
+                      Launch Operation
+                    </button>
+                  }
+                  @if (activeOperation().status() === 'active') {
+                    <button (click)="stopCurrentOperation()" class="w-full sm:w-auto px-6 py-3 bg-yellow-600 text-white font-bold rounded-lg shadow-lg hover:bg-yellow-500 transition">
+                      Stop Operation (Response Received)
+                    </button>
+                  }
+              </div>
+            </div>
+          </div>
+        }
+      </div>
+    </div>
+  `,
+  styles: [`
+    .animate-fade-in { animation: fadeIn 0.5s ease-in-out; }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(-10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+  `],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+})
+export class App {
+  // --- Firebase State ---
+  private firebase: any = {};
+  private auth: any;
+  private db: any;
+  private operationsUnsubscribe: (() => void) | null = null;
+  private crewsUnsubscribe: (() => void) | null = null;
+
+  // --- App State ---
+  user = signal<any | null>(null);
+  isLoading = signal<boolean>(true);
+  currentPage = signal<'library' | 'editor'>('library');
+  
+  crews = signal<Crew[]>([]);
+  operations = signal<Operation[]>([]);
+
+  activeCrewFilter = signal<string>('all');
+  activeStatusFilter = signal<string>('all');
+  activeOperation: WritableSignal<any | null> = signal(null);
+  
+  constructor() {
+    this.initFirebase();
+  }
+
+  async initFirebase() {
+    try {
+      const appModule = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js");
+      const authModule = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js");
+      const firestoreModule = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js");
+      
+      this.firebase = { ...appModule, ...authModule, ...firestoreModule };
+
+      const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+      const app = this.firebase.initializeApp(firebaseConfig);
+      this.auth = this.firebase.getAuth(app);
+      this.db = this.firebase.getFirestore(app);
+      
+      this.handleAuthStateChanges();
+    } catch (error) {
+      console.error("Firebase initialization failed:", error);
+      this.isLoading.set(false); // Stop loading on failure
+    }
+  }
+
+  // --- Computed Properties ---
+  isOperationActive = computed(() => this.activeOperation()?.status() === 'active');
+  isOperationValid = computed(() => {
+    const op = this.activeOperation();
+    if (!op) return false;
+    return op.honchoEmail().trim() && op.initialSubject().trim() && op.initialContent().trim();
+  });
+
+  filteredOperations = computed(() => {
+    const ops = this.operations();
+    const crewFilterId = this.activeCrewFilter();
+    const statusFilter = this.activeStatusFilter();
+
+    let filtered = ops;
+
+    // Apply crew filter
+    if (crewFilterId !== 'all') {
+      filtered = filtered.filter(op => op.crewId === crewFilterId);
+    }
+
+    // Apply status filter
+    if (statusFilter !== 'all') {
+      filtered = filtered.filter(op => op.status === statusFilter);
+    }
+
+    return filtered;
+  });
+
+  // --- Authentication ---
+  private async handleAuthStateChanges() {
+    // This environment provides a token for direct sign-in.
+    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        try {
+            await this.firebase.signInWithCustomToken(this.auth, __initial_auth_token);
+        } catch (error) {
+            console.error("Custom token sign-in failed, trying anonymous:", error);
+            await this.firebase.signInAnonymously(this.auth);
+        }
+    } else {
+        // Fallback for local development or other environments
+        await this.firebase.signInAnonymously(this.auth);
+    }
+      
+    this.firebase.onAuthStateChanged(this.auth, (user: any) => {
+      this.user.set(user);
+      this.detachListeners(); // Clean up old listeners
+      if (user) {
+        this.attachDataListeners(user.uid);
+      } else {
+        // Clear data if user logs out
+        this.operations.set([]);
+        this.crews.set([]);
+        this.isLoading.set(false);
+      }
+    });
+  }
+  
+  async handleSignOut() {
+    try {
+      await this.firebase.signOut(this.auth);
+      this.navigateTo('library');
+       // After signing out, sign in anonymously to keep the app functional
+      await this.firebase.signInAnonymously(this.auth);
+    } catch (error) {
+      console.error("Error signing out: ", error);
+    }
+  }
+
+  // --- Firestore Data Handling ---
+  private attachDataListeners(userId: string) {
+    this.isLoading.set(true);
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    const privateDataPath = `/artifacts/${appId}/users/${userId}`;
+
+    // Listener for Operations
+    const opsQuery = this.firebase.collection(this.db, `${privateDataPath}/operations`);
+    this.operationsUnsubscribe = this.firebase.onSnapshot(opsQuery, (snapshot: any) => {
+      const ops = snapshot.docs.map((doc: any) => ({ id: doc.id, ...doc.data() } as Operation));
+      this.operations.set(ops);
+      this.isLoading.set(false);
+    }, (error: any) => {
+      console.error("Error fetching operations: ", error);
+      this.isLoading.set(false);
+    });
+    
+    // Listener for Crews
+    const crewsQuery = this.firebase.collection(this.db, `${privateDataPath}/crews`);
+    this.crewsUnsubscribe = this.firebase.onSnapshot(crewsQuery, (snapshot: any) => {
+      const crews = snapshot.docs.map((doc: any) => ({ id: doc.id, ...doc.data() } as Crew));
+      this.crews.set(crews);
+    }, (error: any) => console.error("Error fetching crews: ", error));
+  }
+
+  private detachListeners() {
+    if (this.operationsUnsubscribe) this.operationsUnsubscribe();
+    if (this.crewsUnsubscribe) this.crewsUnsubscribe();
+  }
+  
+  // --- Navigation & CRUD ---
+  navigateTo(page: 'library' | 'editor') {
+    this.currentPage.set(page);
+    if(page === 'library') {
+      this.activeOperation.set(null);
+    }
+  }
+
+  startNewOperation() {
+    const newOp: Operation = {
+      id: '', // Firestore will generate ID
+      honchoEmail: '', status: 'designing', initialSubject: '', initialContent: '', hits: [], hitsSent: 0,
+    };
+    this.editOperation(newOp);
+  }
+
+  editOperation(op: Operation) {
+    this.activeOperation.set({
+        id: op.id,
+        honchoEmail: signal(op.honchoEmail),
+        crewName: signal(this.getCrewNameById(op.crewId) || ''),
+        status: signal(op.status),
+        initialSubject: signal(op.initialSubject),
+        initialContent: signal(op.initialContent),
+        startDate: signal(op.startDate),
+        hitsSent: signal(op.hitsSent),
+        lastHitDate: signal(op.lastHitDate),
+        hits: signal([...op.hits.map(h => ({...h}))])
+    });
+    this.navigateTo('editor');
+  }
+
+  async saveOperation() {
+    const user = this.user();
+    const activeOpData = this.activeOperation();
+    if (!user || !activeOpData) return;
+
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    const privateDataPath = `/artifacts/${appId}/users/${user.uid}`;
+    
+    // Handle Crew creation/lookup
+    let crewId: string | undefined;
+    const crewName = activeOpData.crewName().trim();
+    if (crewName) {
+      const crewsCollection = this.firebase.collection(this.db, `${privateDataPath}/crews`);
+      const q = this.firebase.query(crewsCollection, this.firebase.where("name", "==", crewName));
+      const querySnapshot = await this.firebase.getDocs(q);
+
+      if (!querySnapshot.empty) {
+        crewId = querySnapshot.docs[0].id;
+      } else {
+        const newCrewDoc = await this.firebase.addDoc(crewsCollection, { name: crewName });
+        crewId = newCrewDoc.id;
+      }
+    }
+
+    const opData: Omit<Operation, 'id'> = {
+      honchoEmail: activeOpData.honchoEmail(),
+      crewId: crewId ?? null,
+      status: activeOpData.status(),
+      initialSubject: activeOpData.initialSubject(),
+      initialContent: activeOpData.initialContent(),
+      startDate: activeOpData.startDate() ?? null,
+      hitsSent: activeOpData.hitsSent(),
+      lastHitDate: activeOpData.lastHitDate() ?? null,
+      hits: activeOpData.hits(),
+    };
+    
+    try {
+      const opCollection = this.firebase.collection(this.db, `${privateDataPath}/operations`);
+      if (activeOpData.id) {
+        await this.firebase.setDoc(this.firebase.doc(opCollection, activeOpData.id), opData);
+      } else {
+        await this.firebase.addDoc(opCollection, opData);
+      }
+      this.navigateTo('library');
+    } catch (error) {
+      console.error("Error saving operation: ", error);
+    }
+  }
+
+  async deleteOperation(id: string) {
+    const user = this.user();
+    if (!user || !id) return;
+    try {
+      const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+      const privateDataPath = `/artifacts/${appId}/users/${user.uid}`;
+      await this.firebase.deleteDoc(this.firebase.doc(this.db, `${privateDataPath}/operations`, id));
+    } catch (error) {
+      console.error("Error deleting operation: ", error);
+    }
+  }
+
+  // --- Editor-Specific Logic ---
+  updateActiveOp(key: string, value: any) {
+    const op = this.activeOperation();
+    if (op && key in op && typeof op[key] === 'function') {
+      op[key].set(value);
+    }
+  }
+  
+  addHit() {
+    const op = this.activeOperation();
+    if (!op || this.isOperationActive()) return;
+    const newId = op.hits().length > 0 ? Math.max(...op.hits().map((h: Hit) => h.id)) + 1 : 1;
+    op.hits.update((hits: Hit[]) => [...hits, { id: newId, delayDays: 3, subject: '', content: '', type: 'in_thread' }]);
+  }
+
+  removeHit(id: number) {
+    const op = this.activeOperation();
+    if (!op || this.isOperationActive()) return;
+    op.hits.update((hits: Hit[]) => hits.filter(hit => hit.id !== id));
+  }
+
+  updateHit(id: number, key: keyof Hit, value: any) {
+    const op = this.activeOperation();
+    if (!op || this.isOperationActive()) return;
+    op.hits.update((hits: Hit[]) => hits.map(h => h.id === id ? { ...h, [key]: key === 'delayDays' ? parseInt(value) || 0 : value } : h ));
+  }
+  
+  async startCurrentOperation() {
+    if (!this.isOperationValid() || !this.user()) return;
+    const op = this.activeOperation();
+    op.status.set('active');
+    op.startDate.set(Date.now());
+    op.lastHitDate.set(Date.now());
+    op.hitsSent.set(1);
+    await this.saveOperation();
+  }
+
+  async stopCurrentOperation() {
+    const op = this.activeOperation();
+    op.status.set('stopped');
+    await this.saveOperation();
+  }
+
+  // --- Display Helpers ---
+  getTotalDays(op: Operation): number { return op.hits.reduce((total, hit) => total + hit.delayDays, 0); }
+  getDaysRun(op: Operation): string {
+    if (op.status !== 'active' || !op.startDate) return 'N/A';
+    const oneDay = 24 * 60 * 60 * 1000;
+    const days = Math.round(Math.abs((Date.now() - op.startDate) / oneDay));
+    return `${days} days`;
+  }
+  getCrewNameById(crewId?: string): string | undefined {
+    if (!crewId) return undefined;
+    return this.crews().find(c => c.id === crewId)?.name;
+  }
+}
+
